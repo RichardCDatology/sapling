@@ -274,6 +274,39 @@ impl VFS {
             .collect())
     }
 
+    /// List `path` along with no-follow metadata for each entry, without
+    /// following symlinks.
+    ///
+    /// Prefer this over calling `metadata()` once per name returned by
+    /// `list_dir()`: on Unix this reuses the directory fd opened for the
+    /// listing instead of reopening the directory from the root for every
+    /// entry, which otherwise dominates large-directory walks.
+    pub fn list_dir_with_metadata(
+        &self,
+        path: &RepoPath,
+    ) -> Result<Vec<Result<(PathComponentBuf, LiteMetadata)>>> {
+        if !path.is_empty() {
+            self.inner.auditor.audit_components(path)?;
+        }
+
+        Ok(self
+            .no_follow()?
+            .list_dir_with_metadata((!path.is_empty()).then_some(path))?
+            .into_iter()
+            .map(|(name, metadata)| {
+                let component = path_component_from_dir_entry(name)?;
+                // Only the new leaf needs auditing here: `path`'s components
+                // (the parent directory we just listed) were already audited
+                // when this directory itself was reached during the walk.
+                let component_str = <PathComponentBuf as AsRef<str>>::as_ref(&component);
+                self.inner
+                    .auditor
+                    .audit_components(RepoPath::from_str(component_str)?)?;
+                Ok((component, metadata?))
+            })
+            .collect())
+    }
+
     pub fn metadata(&self, path: &RepoPath) -> Result<LiteMetadata> {
         tracing::trace!(?path, "fetching metadata");
 
@@ -1040,6 +1073,75 @@ mod unix_tests {
         let vfs = VFS::new_destructive(tmp.path().to_path_buf()).unwrap();
         let path = RepoPath::from_str("link").unwrap();
         assert!(vfs.list_dir(path).is_err());
+    }
+
+    #[test]
+    fn test_list_dir_with_metadata_matches_list_dir_plus_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("file"), b"content").unwrap();
+        let vfs = VFS::new_destructive(tmp.path().to_path_buf()).unwrap();
+
+        let mut entries = vfs
+            .list_dir_with_metadata(RepoPath::empty())
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.unwrap())
+            .map(|(name, metadata)| (name.into_string(), metadata))
+            .collect::<Vec<_>>();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "file");
+        assert!(entries[0].1.is_file());
+        assert_eq!(entries[1].0, "sub");
+        assert!(entries[1].1.is_dir());
+    }
+
+    #[test]
+    fn test_list_dir_with_metadata_reports_invalid_entries_per_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("file"), b"content").unwrap();
+        fs::write(tmp.path().join("bad\nname"), b"content").unwrap();
+        let vfs = VFS::new_destructive(tmp.path().to_path_buf()).unwrap();
+
+        let entries = vfs.list_dir_with_metadata(RepoPath::empty()).unwrap();
+        let mut valid = Vec::new();
+        let mut invalid_count = 0;
+        for entry in entries {
+            match entry {
+                Ok((name, _metadata)) => valid.push(name.into_string()),
+                Err(_) => invalid_count += 1,
+            }
+        }
+        valid.sort();
+
+        assert_eq!(valid, vec!["file".to_string()]);
+        assert_eq!(invalid_count, 1);
+    }
+
+    #[test]
+    fn test_list_dir_with_metadata_rejects_reserved_child_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join(".sl")).unwrap();
+        fs::write(tmp.path().join("file"), b"content").unwrap();
+        let vfs = VFS::new_destructive(tmp.path().to_path_buf()).unwrap();
+
+        // `.sl` is a reserved name: the auditor must still reject it here, even
+        // though it is now validated per-entry against the already-listed
+        // parent instead of via a second full-path `metadata()` call.
+        let mut valid = Vec::new();
+        let mut invalid_count = 0;
+        for entry in vfs.list_dir_with_metadata(RepoPath::empty()).unwrap() {
+            match entry {
+                Ok((name, _metadata)) => valid.push(name.into_string()),
+                Err(_) => invalid_count += 1,
+            }
+        }
+        valid.sort();
+
+        assert_eq!(valid, vec!["file".to_string()]);
+        assert_eq!(invalid_count, 1);
     }
 
     #[test]

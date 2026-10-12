@@ -292,6 +292,68 @@ fn list_dir_lists_child_entries() -> io::Result<()> {
 }
 
 #[test]
+fn list_dir_with_metadata_matches_list_dir_plus_symlink_metadata() -> io::Result<()> {
+    let dir = tempdir()?;
+    fs::create_dir_all(dir.path().join("parent/sub"))?;
+    fs::write(dir.path().join("parent/file"), b"contents")?;
+    let root = NoFollowRoot::new(dir.path())?;
+
+    let mut combined = root
+        .list_dir_with_metadata(Some(Path::new("parent")))?
+        .into_iter()
+        .map(|(name, metadata)| {
+            let metadata = metadata.expect("metadata should be available for each entry");
+            (name.to_string_lossy().into_owned(), metadata)
+        })
+        .collect::<Vec<_>>();
+    combined.sort_by(|a, b| a.0.cmp(&b.0));
+
+    assert_eq!(
+        combined.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>(),
+        vec!["file".to_string(), "sub".to_string()]
+    );
+
+    let (file_name, file_metadata) = &combined[0];
+    assert_eq!(file_name, "file");
+    assert!(file_metadata.is_file());
+    assert_eq!(file_metadata.size, "contents".len() as u64);
+
+    let (sub_name, sub_metadata) = &combined[1];
+    assert_eq!(sub_name, "sub");
+    assert!(sub_metadata.is_dir());
+
+    Ok(())
+}
+
+#[test]
+fn list_dir_with_metadata_reports_invalid_entry_without_failing_others() -> io::Result<()> {
+    let dir = tempdir()?;
+    fs::create_dir_all(dir.path().join("parent"))?;
+    fs::write(dir.path().join("parent/file"), b"contents")?;
+    std::os::unix::fs::symlink("/tmp", dir.path().join("parent/escape"))?;
+    let root = NoFollowRoot::new(dir.path())?;
+
+    let entries = root.list_dir_with_metadata(Some(Path::new("parent")))?;
+    assert_eq!(entries.len(), 2);
+
+    let file_entry = entries
+        .iter()
+        .find(|(name, _)| name == "file")
+        .expect("file entry present");
+    assert!(file_entry.1.as_ref().unwrap().is_file());
+
+    let escape_entry = entries
+        .iter()
+        .find(|(name, _)| name == "escape")
+        .expect("escape entry present");
+    // The symlink itself is reported, not followed: no-follow metadata reports
+    // it as a symlink rather than erroring or resolving through it.
+    assert!(escape_entry.1.as_ref().unwrap().is_symlink());
+
+    Ok(())
+}
+
+#[test]
 fn list_dir_rejects_file_leaf() -> io::Result<()> {
     let dir = tempdir()?;
     fs::write(dir.path().join("file"), b"contents")?;

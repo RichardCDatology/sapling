@@ -174,18 +174,18 @@ where
 
     // WARNING: SIDE EFFECTS - if entry matches and is child directory, will push
     // child and increment busy_nodes atomic.
+    //
+    // `metadata` is fetched by the caller from the same directory listing
+    // that produced `filename`, rather than via a second, separate VFS
+    // metadata lookup (see `list_dir_with_metadata`).
     fn match_entry_and_enqueue(
         dir: &RepoPathBuf,
         filename: &RepoPath,
+        metadata: LiteMetadata,
         shared_data: Arc<WalkerData<M>>,
     ) -> Result<()> {
         let mut candidate_path = dir.clone();
         candidate_path.push(filename);
-        let metadata = match shared_data.vfs.metadata(candidate_path.as_repo_path()) {
-            Ok(metadata) => metadata,
-            Err(err) if is_invalid_component_error(&err) => return Ok(()),
-            Err(err) => return Err(err),
-        };
         if metadata.is_file() || metadata.is_symlink() {
             if shared_data
                 .matcher
@@ -260,26 +260,27 @@ where
                                     }
                                 }
 
-                                for filename in shared_data.vfs.list_dir(dir.as_repo_path())? {
-                                    let filename = match filename {
-                                        Ok(filename) => filename.into_string(),
+                                // Fetch metadata for every entry from the same directory
+                                // listing instead of a separate per-entry VFS lookup: that
+                                // second lookup used to reopen this directory from the root
+                                // once per entry, which dominates the walk for large
+                                // directories.
+                                for entry in
+                                    shared_data.vfs.list_dir_with_metadata(dir.as_repo_path())?
+                                {
+                                    let (component, metadata) = match entry {
+                                        Ok(entry) => entry,
+                                        Err(err) if is_invalid_component_error(&err) => continue,
                                         Err(err) => {
                                             shared_data.enqueue_result(Err(err))?;
                                             continue;
                                         }
                                     };
-                                    let repo_filename = match RepoPath::from_str(&filename) {
-                                        Ok(filename) => filename,
-                                        Err(err) => {
-                                            shared_data.enqueue_result(Err(
-                                                WalkError::RepoPathError(filename, err).into(),
-                                            ))?;
-                                            continue;
-                                        }
-                                    };
+                                    let filename: &RepoPath = component.as_ref();
                                     if let Err(e) = Walker::match_entry_and_enqueue(
                                         &dir,
-                                        repo_filename,
+                                        filename,
+                                        metadata,
                                         shared_data.clone(),
                                     ) {
                                         shared_data.enqueue_result(Err(e))?;

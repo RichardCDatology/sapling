@@ -205,6 +205,42 @@ impl NoFollowRoot {
         .map_err(|err| path_error::build(err, path_error::LIST_DIR, list_path))
     }
 
+    /// List a directory along with no-follow metadata for each entry.
+    ///
+    /// Like [`NoFollowRoot::list_dir`], but also returns `lstat`-style
+    /// metadata per entry, fetched relative to the same directory fd used for
+    /// the listing. Callers that need metadata for every (or most) entries
+    /// should prefer this over calling [`NoFollowRoot::symlink_metadata`] once
+    /// per entry, which reopens the directory from the root each time.
+    pub fn list_dir_with_metadata<'a, P>(
+        &self,
+        path: Option<P>,
+    ) -> io::Result<Vec<(OsString, io::Result<LiteMetadata>)>>
+    where
+        P: TryInto<CheckedRelPath<'a>>,
+        P::Error: Into<io::Error>,
+    {
+        let path = path
+            .map(|path| path.try_into().map_err(Into::into))
+            .transpose()?;
+        let list_path = path
+            .as_ref()
+            .map_or_else(|| Path::new("."), CheckedRelPath::as_path);
+        retry_io(|| {
+            // See the comment in `list_dir` about not dup-ing the root fd.
+            let path_c = path_cstring(list_path)?;
+            let dir = open_path(
+                self.root.as_fd(),
+                &path_c,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                0,
+            )?;
+            list_dir_with_metadata(dir)
+        })
+        .map_err(super::normalize_not_directory)
+        .map_err(|err| path_error::build(err, path_error::LIST_DIR, list_path))
+    }
+
     /// Write a regular file at `path`, creating parent directories.
     ///
     /// `path` must be relative and must not contain `..`. Parent directories
@@ -608,7 +644,7 @@ fn open_dir_no_follow_cstring(dir: BorrowedFd<'_>, rel_path: &CString) -> io::Re
 
 fn list_dir(dir: OwnedFd) -> io::Result<Vec<OsString>> {
     let mut names = Vec::new();
-    read_dir_names(dir, |name| {
+    read_dir_names(dir, |name, _dir_fd| {
         names.push(OsString::from_vec(name.into_bytes()));
         Ok(())
     })?;
@@ -732,7 +768,7 @@ impl PendingDirRemove {
         // Finish enumeration before deleting entries: mutating a directory while
         // iterating its stream is platform-sensitive.
         let mut names = Vec::new();
-        read_dir_names(dir.as_fd().try_clone_to_owned()?, |name| {
+        read_dir_names(dir.as_fd().try_clone_to_owned()?, |name, _dir_fd| {
             names.push(name);
             Ok(())
         })?;
@@ -955,7 +991,7 @@ impl Drop for Dir {
 
 fn read_dir_names<F>(fd: OwnedFd, mut visit: F) -> io::Result<()>
 where
-    F: FnMut(CString) -> io::Result<()>,
+    F: FnMut(CString, BorrowedFd<'_>) -> io::Result<()>,
 {
     let raw_fd = fd.into_raw_fd();
     let dir = unsafe {
@@ -973,6 +1009,9 @@ where
         return Err(err);
     }
     let dir = Dir(dir);
+    // Safe to stat entries against this fd for as long as `dir` is alive: it
+    // is the same fd `fdopendir` took ownership of above.
+    let dir_fd = unsafe { BorrowedFd::borrow_raw(libc::dirfd(dir.0)) };
 
     loop {
         let entry = retry_io(|| {
@@ -1004,8 +1043,23 @@ where
         }
         // `readdir` reuses its internal entry buffer, so callers cannot safely
         // keep borrowed name references across iterations.
-        visit(name.to_owned())?;
+        visit(name.to_owned(), dir_fd)?;
     }
+}
+
+/// List names in `dir` along with no-follow metadata for each entry, reusing
+/// the single directory fd opened for the listing instead of reopening the
+/// directory from the root once per entry (see `NoFollowRoot::metadata`).
+fn list_dir_with_metadata(dir: OwnedFd) -> io::Result<Vec<(OsString, io::Result<LiteMetadata>)>> {
+    let mut entries = Vec::new();
+    read_dir_names(dir, |name, dir_fd| {
+        let metadata = retry_io(|| {
+            fstatat(dir_fd, &name, libc::AT_SYMLINK_NOFOLLOW).map(|stat| lite_metadata_from_stat(&stat))
+        });
+        entries.push((OsString::from_vec(name.into_bytes()), metadata));
+        Ok(())
+    })?;
+    Ok(entries)
 }
 
 fn invalid_openat_path() -> libc::c_int {

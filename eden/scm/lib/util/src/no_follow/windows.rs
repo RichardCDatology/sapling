@@ -256,6 +256,38 @@ impl NoFollowRoot {
         .map_err(|err| path_error::build(err, path_error::LIST_DIR, list_path))
     }
 
+    /// List a directory along with no-follow metadata for each entry.
+    ///
+    /// This is a plain composition of [`NoFollowRoot::list_dir`] and
+    /// [`NoFollowRoot::symlink_metadata`] per entry. Unlike the Unix
+    /// implementation, this does not reuse a single directory handle across
+    /// entries, since Windows reparse-point checks go through
+    /// `open_reparse_leaf` rather than an fd-relative stat.
+    pub fn list_dir_with_metadata<'a, P>(
+        &self,
+        path: Option<P>,
+    ) -> io::Result<Vec<(OsString, io::Result<LiteMetadata>)>>
+    where
+        P: TryInto<CheckedRelPath<'a>>,
+        P::Error: Into<io::Error>,
+    {
+        let path = path
+            .map(|path| path.try_into().map_err(Into::into))
+            .transpose()?;
+        let base = path
+            .as_ref()
+            .map_or_else(|| Path::new(""), CheckedRelPath::as_path);
+        let names = self.list_dir(path.as_ref().map(CheckedRelPath::as_path))?;
+        Ok(names
+            .into_iter()
+            .map(|name| {
+                let child = base.join(&name);
+                let metadata = self.symlink_metadata(Some(&child));
+                (name, metadata)
+            })
+            .collect())
+    }
+
     /// Write a regular file at `path`, creating parent directories.
     ///
     /// `path` must be relative and must not contain `..`. If the leaf already
