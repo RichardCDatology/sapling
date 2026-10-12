@@ -25,6 +25,7 @@ use crossbeam::channel::unbounded;
 use pathmatcher::DirectoryMatch;
 use pathmatcher::Matcher;
 use thiserror::Error;
+use types::PathComponentBuf;
 use types::RepoPath;
 use types::RepoPathBuf;
 use types::path::ParseError;
@@ -240,34 +241,23 @@ where
                                         .enqueue_result(Ok(WalkEntry::Directory(dir.clone())))?;
                                 }
 
-                                if !dir.is_empty() {
-                                    let dot_dir = RepoPath::from_str(&shared_data.dot_dir)
-                                        .map_err(|err| {
-                                            WalkError::RepoPathError(
-                                                shared_data.dot_dir.clone(),
-                                                err,
-                                            )
-                                        })?;
-                                    let mut dot_dir_path = dir.clone();
-                                    dot_dir_path.push(dot_dir);
-                                    if shared_data
-                                        .vfs
-                                        .raw_no_follow_root()?
-                                        .symlink_metadata(Some(dot_dir_path.as_repo_path()))
-                                        .is_ok()
-                                    {
-                                        return Ok(());
-                                    }
-                                }
-
                                 // Fetch metadata for every entry from the same directory
                                 // listing instead of a separate per-entry VFS lookup: that
                                 // second lookup used to reopen this directory from the root
                                 // once per entry, which dominates the walk for large
                                 // directories.
-                                for entry in
-                                    shared_data.vfs.list_dir_with_metadata(dir.as_repo_path())?
-                                {
+                                let entries =
+                                    shared_data.vfs.list_dir_with_metadata(dir.as_repo_path())?;
+
+                                // A child literally named the dot-dir (e.g. ".sl"/".git") marks
+                                // `dir` as a nested repo: skip it entirely without enqueuing any
+                                // of its other entries. This reuses the listing above instead of
+                                // a separate no-follow resolution of `dir/<dot_dir>` from the root.
+                                if !dir.is_empty() && entries.iter().any(|entry| is_dot_dir_entry(entry, &shared_data.dot_dir)) {
+                                    return Ok(());
+                                }
+
+                                for entry in entries {
                                     let (component, metadata) = match entry {
                                         Ok(entry) => entry,
                                         Err(err) if is_invalid_component_error(&err) => continue,
@@ -329,6 +319,18 @@ fn is_invalid_component_error(err: &Error) -> bool {
     matches!(
         err.downcast_ref::<AuditError>(),
         Some(AuditError::InvalidComponent(_, _))
+    )
+}
+
+/// True if `entry` is the (always-invalid-component) listing result for a
+/// child literally named `dot_dir`, e.g. ".sl" or ".git".
+fn is_dot_dir_entry(entry: &Result<(PathComponentBuf, LiteMetadata)>, dot_dir: &str) -> bool {
+    let Err(err) = entry else {
+        return false;
+    };
+    matches!(
+        err.downcast_ref::<AuditError>(),
+        Some(AuditError::InvalidComponent(name, _)) if name == dot_dir
     )
 }
 
