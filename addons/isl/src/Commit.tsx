@@ -229,7 +229,7 @@ export const Commit = memo(
             </T>
           ),
           onClick: () => {
-            const text = selectedCommitHashes.join(' ');
+            const text = selectedCommitHashes.join('+');
             clipboardCopy(text);
           },
           loggingLabel: 'Copy Selected Commit Hashes',

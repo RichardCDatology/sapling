@@ -99,7 +99,7 @@ export function revsetArgsForComparison(comparison: Comparison): Array<string> {
     case ComparisonType.Committed:
       return ['--change', comparison.hash];
     case ComparisonType.MultipleCommits:
-      return ['--rev', `${comparison.hashRange[0]}^:${comparison.hashRange[1]}`];
+      return ['--rev', `${comparison.hashRange[0]}^::${comparison.hashRange[1]}`];
     case ComparisonType.CommitRange:
       return ['--rev', `${comparison.hashFrom}^::${comparison.hashTo}`];
   }
