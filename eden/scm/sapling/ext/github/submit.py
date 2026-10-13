@@ -363,6 +363,7 @@ async def rewrite_pull_request_body(
         reviewstack=ui.configbool("github", "pull-request-include-reviewstack"),
         review_url_template=review_url_template,
         review_tool_name=review_tool_name,
+        parent_prs_only=ui.configbool("github", "pull-request-parent-prs-only"),
     )
 
     if pr.state != PullRequestState.OPEN:
